@@ -1,0 +1,15 @@
+numpy
+pydicom=2.2.2
+pymedphys
+dicompyler-core
+scipy=1.7.1
+matplotlib
+pandas
+scikit-image
+monai=1.1.0
+pytorch_lightning==1.9.0
+seaborn=0.11.2
+torch=1.10.0
+tqdm
+einops
+levenshtein
