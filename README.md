@@ -1,3 +1,11 @@
+Contact
+-------
+For any inquiries or if you encounter issues with the model, please don't hesitate to get in touch. We are open to collaborating to resolve any problems and to potentially adjust the model to better suit your specific data needs.
+
+Aaron Kieslich
+Email: aaron.kieslich@oncoray.de
+
+
 Usage
 -----
 
@@ -116,3 +124,13 @@ The ROI renaming table should have folllowing structure:The columns lists the RO
 
 An exemplary data sample obtained from a water phantom is available at https://rodare.hzdr.de/record/2764 (water_phantom.zip file).
 Extract the zip file into a directory named `data` at the same level as this README file. Then, a notebook showing how to interpolate and load data and make predictions using a neural network is provided at `src/notebooks/phantom_example.ipynb`.
+
+## Model limitations and future work
+
+Our current model evaluation includes data from two centers employing proton-beam therapy devices from the same vendor (IBA) and using the same delivery technique (pencil beam scanning, PBS). This consistency might contribute to an overly optimistic assessment of the model's generalizability. The uniform treatment hardware and plan optimization strategies, which use a conventional constant RBE value of 1.1, could limit the applicability of our results to centers utilizing different treatment systems or those that employ varying treatment delivery methods, such as double scattering.
+
+Furthermore, the study exclusively involved patients with primary brain tumors, which may restrict the transferability of our findings to other types of cancer where tumor characteristics and patient anatomy differ significantly.
+
+Another important consideration is the potential variability in LETd distributions that could result from novel optimization strategies, despite achieving dosimetrically equivalent plans. Since voxelwise dose distributions can vary with different optimization strategies, they might also carry non-local signatures characteristic of those strategies, affecting LETd distributions.
+
+Our future work will aim to address these limitations by incorporating a broader array of treatment devices, techniques, and tumor types to enhance the robustness and applicability of our models. We also plan to investigate the impact of different plan optimization strategies on LET distributions to further validate and refine our approach.
