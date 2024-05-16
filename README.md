@@ -3,8 +3,13 @@ Contact
 For any inquiries or if you encounter issues with the model, please don't hesitate to get in touch. We are open to collaborating to resolve any problems and to potentially adjust the model to better suit your specific data needs.
 
 Aaron Kieslich
+
 Email: aaron.kieslich@oncoray.de
 
+Citation
+-------
+
+The paper about this project is currently under review. If you use our work, please cite it as soon as it is available. The citation details will be updated here once the paper is published.
 
 Usage
 -----
