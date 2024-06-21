@@ -5,6 +5,7 @@ import pytorch_lightning as pl
 import sys
 import torch
 import pymedphys
+import concurrent.futures
 
 from tqdm import tqdm
 from pathlib import Path
@@ -14,11 +15,24 @@ from functools import partial
 from let.cmd_args import inference_parser
 from let.data import LETDatasetInMemory
 from let.data_transform import get_preprocess_transforms
-from let.model import BasicUNetLETPredictor,\
-    FlexibleUNetLETPredictor, SegResNetLETPredictor, UNETRLETPredictor, collate_for_prediction
+from let.model import (
+    BasicUNetLETPredictor,
+    FlexibleUNetLETPredictor,
+    SegResNetLETPredictor,
+    UNETRLETPredictor,
+    collate_for_prediction,
+)
+from let import ntcp
 
 
-def calculate_gamma(true_dose, predicted_dose, dose_criteria=5, distance_criteria=5):
+def calculate_gamma(
+    true_dose,
+    predicted_dose,
+    relevant_dose_area,
+    dose_criteria,
+    distance_criteria,
+    gamma_setup,
+):
     """
     Calculate the gamma passing rate between the true dose distribution and the predicted dose distribution.
     Assumes true_dose and predicted_dose to be interpolated to 1 x 1 x 1 mm^3 voxel spacing.
@@ -29,10 +43,14 @@ def calculate_gamma(true_dose, predicted_dose, dose_criteria=5, distance_criteri
         The true dose distribution.
     predicted_dose : numpy.ndarray
         The predicted dose distribution.
+    relevant_dose_area : numpy.ndarray
+            A boolean array of the same shape as true_dose, where True values indicate the voxels that are relevant for the gamma calculation.
     dose_criteria : float
         The dose difference criteria, in percentage of the local dose.
     distance_criteria : float
         The distance-to-agreement criteria, in mm.
+    gamma_setup: string
+        Sets global or local gamma analysis
 
     Returns
     -------
@@ -41,13 +59,27 @@ def calculate_gamma(true_dose, predicted_dose, dose_criteria=5, distance_criteri
 
     """
 
-    assert true_dose.shape == predicted_dose.shape, "True and predicted dose maps must have the same shape."
-    assert dose_criteria >= 0, "Dose criteria must be non-negative."
-    assert distance_criteria >= 0, "Distance criteria must be non-negative."
+    assert (
+        true_dose.shape == predicted_dose.shape
+    ), "True and predicted dose maps must have the same shape."
 
     # gets the reference coordinates. Expects true_dose to have 1mm voxel
-    coords = (np.arange(np.shape(true_dose)[0]), np.arange(np.shape(true_dose)[1]),
-              np.arange(np.shape(true_dose)[2]))
+    coords = (
+        np.arange(np.shape(true_dose)[0]),
+        np.arange(np.shape(true_dose)[1]),
+        np.arange(np.shape(true_dose)[2]),
+    )
+
+    if gamma_setup == "local":
+        local_gamma = True
+    else:
+        local_gamma = False
+
+    # set regions without relevant dose to 0 to definetly exclude them in the evaluation
+    true_dose[~relevant_dose_area] = 0
+    predicted_dose[~relevant_dose_area] = 0
+
+    max_dose = np.max(true_dose[relevant_dose_area])
 
     print("Perform gamma analysis....")
     gamma = pymedphys.gamma(
@@ -57,20 +89,21 @@ def calculate_gamma(true_dose, predicted_dose, dose_criteria=5, distance_criteri
         dose_evaluation=predicted_dose,
         dose_percent_threshold=dose_criteria,
         distance_mm_threshold=distance_criteria,
-        # calc gamma index for all voxels above 0
-        lower_percent_dose_cutoff=0,
-        # sets the dose_criteria to be normed on local dose and not max dose
-        local_gamma=True,
-        # just calculates to max gamma of 1.0001 to speed up calculations
-        max_gamma=1.0001,
-        interp_fraction=1                           # perform no grid interpolation
+        global_normalisation=max_dose,
+        # calc gamma index for all voxels above the minimum value within the relevant dose area to speed it up
+        lower_percent_dose_cutoff=10,
+        # sets the dose_criteria to be normed on global max dose
+        local_gamma=local_gamma,
+        # just calculates to max gamma of 1.1 to speed up calculations
+        max_gamma=1.1,
+        interp_fraction=5,
     )
     print("Gamma_indexes calculated!")
 
     return gamma
 
 
-def evaluate_gamma(gamma_map, true_dose_map, n_dose_bins=5, roi_mask=None):
+def evaluate_gamma(gamma_map, true_dose_map, roi_mask, relevant_dose_area):
     """
     Evaluate the gamma index passing rates using dose bins and ROI, and return the results in a pandas DataFrame.
 
@@ -80,10 +113,10 @@ def evaluate_gamma(gamma_map, true_dose_map, n_dose_bins=5, roi_mask=None):
         The gamma index map, represented as a 3D numpy array.
     true_dose_map : numpy.ndarray
         The true dose distribution map, represented as a 3D numpy array.
-    n_dose_bins : int
-        The number of dose bins to use for the gamma analysis evaluation.
-    roi_mask : numpy.ndarray, optional
+    roi_mask : numpy.ndarray
         A boolean mask representing the region of interest.
+    relevant_dose_area: numpy.ndarray
+        A boolean mask representing the region of relevant dose
 
     Returns
     -------
@@ -93,55 +126,28 @@ def evaluate_gamma(gamma_map, true_dose_map, n_dose_bins=5, roi_mask=None):
         true_dose map. If roi does not have voxels of specific dose range, nan values gets inserted.
     """
 
-    assert gamma_map.shape == true_dose_map.shape, "Gamma map and true dose map must have the same shape."
-    assert n_dose_bins > 0, "Number of dose bins must be greater than 0."
+    assert (
+        gamma_map.shape == true_dose_map.shape
+    ), "Gamma map and true dose map must have the same shape."
+
     if roi_mask is not None:
-        assert roi_mask.shape == true_dose_map.shape, "ROI mask must have the same shape as the true dose map."
+        assert (
+            roi_mask.shape == true_dose_map.shape
+        ), "ROI mask must have the same shape as the true dose map."
 
     # Create empty lists to store the passing rate, number of voxels and column names for each dose bin
     result = {}
 
-    # Calculate the dose bins
-    max_dose = np.max(true_dose_map)
-    dose_bin_edges = np.linspace(0, max_dose, n_dose_bins+1, endpoint=True)
-    dose_bin_percents = np.linspace(0, 100, n_dose_bins+1, endpoint=True)
-
-    # Calculate the gamma index passing rate for the complete dose range
-    if roi_mask is not None:
-        gamma_map_roi = gamma_map[roi_mask]
-    else:
-        gamma_map_roi = gamma_map
-
-    num_passed = np.sum(gamma_map_roi < 1)
-    total_voxels = np.count_nonzero(~np.isnan(gamma_map_roi))
-    passing_rate = num_passed / total_voxels if total_voxels > 0 else np.nan
+    # As gamma analysis might be not calculated for whole image, handle nan values correctly
+    gamma_map_result = np.where(np.isnan(gamma_map), np.nan, gamma_map < 1)
+    passing_rate = np.nanmean(gamma_map_result[roi_mask])
+    num_passed = np.nansum(gamma_map_result[roi_mask])
 
     # Add the passing rate, number of passed voxels and column names to the result dict
-    result[f"Passing rate: {dose_bin_percents[0]}% - {dose_bin_percents[-1]}%"] = passing_rate
-    result[f"Number of passed voxels: {dose_bin_percents[0]}% - {dose_bin_percents[-1]}%"] = num_passed
+    result["Passing rate"] = passing_rate
+    result["Number of passed voxels"] = num_passed
 
-    if n_dose_bins != 1:
-        # Iterate through each dose bin
-        for i in range(n_dose_bins):
-            # Select voxels in the current dose bin
-            dose_bin_mask = (true_dose_map >= dose_bin_edges[i]) & (
-                true_dose_map < dose_bin_edges[i+1])
-
-            if roi_mask is not None:
-                dose_bin_mask = dose_bin_mask & roi_mask
-
-            dose_bin_gamma = gamma_map[dose_bin_mask]
-
-            # Calculate the gamma index passing rate for the current dose bin
-            dose_bin_num_passed = np.sum(dose_bin_gamma < 1)
-            dose_bin_total_voxels = np.count_nonzero(~np.isnan(dose_bin_gamma))
-            # is nan if no voxels in this dose range
-            dose_bin_passing_rate = dose_bin_num_passed / \
-                dose_bin_total_voxels if dose_bin_total_voxels > 0 else np.nan
-
-            # Add the passing rate and number of passed voxels to the result dict
-            result[f"Passing rate: {dose_bin_percents[i]}% - {dose_bin_percents[i+1]}%"] = dose_bin_passing_rate
-            result[f"Number of passed voxels: {dose_bin_percents[i]}% - {dose_bin_percents[i+1]}%"] = dose_bin_num_passed
+    print(f"Passing rate: {passing_rate} | Number of passed voxels: {num_passed}")
 
     return result
 
@@ -163,7 +169,8 @@ def compute_xcc_metric(data_arr, x):
     if len(data_arr) < n_voxels:
         print(
             f"[WW]: in compute_{x}cc: n_voxels={n_voxels}, but input has "
-            f"only length {len(data_arr)}!")
+            f"only length {len(data_arr)}!"
+        )
 
     # get the minimum of the n_voxels largest values
     # which is kind of a percentile, but we fix the number of voxels, not
@@ -251,10 +258,9 @@ def ipsi_and_contralateral_lookup(plan_data_dict, rois_to_evaluate):
     return ipsicontra_mapping
 
 
-def evaluate_sample(plan_data_dict,
-                    voxel_aggregations,
-                    rois_to_evaluate,
-                    voxel_error_types):
+def evaluate_sample(
+    plan_data_dict, voxel_aggregations, rois_to_evaluate, voxel_error_types
+):
     """
     Parameters
     ----------
@@ -282,13 +288,13 @@ def evaluate_sample(plan_data_dict,
         "1_percentile": partial(np.percentile, q=1),
         "2_percentile": partial(np.percentile, q=2),
         "98_percentile": partial(np.percentile, q=98),
-        "99_percentile": partial(np.percentile, q=99)
+        "99_percentile": partial(np.percentile, q=99),
     }
 
     # lookup dict for the error types
     voxel_error_type_fns = {
         "unsigned_absolute": lambda gt, pred: np.abs(gt - pred),
-        "signed_absolute": lambda gt, pred: gt - pred
+        "signed_absolute": lambda gt, pred: gt - pred,
     }
 
     sample_plan = plan_data_dict["plan_id"]
@@ -299,11 +305,10 @@ def evaluate_sample(plan_data_dict,
     # None means the whole volume irrespective of a ROI
     results = []
 
-    ipsicontra_map = ipsi_and_contralateral_lookup(
-        plan_data_dict, rois_to_evaluate)
+    ipsicontra_map = ipsi_and_contralateral_lookup(plan_data_dict, rois_to_evaluate)
     # translate the value to what will be written in the csv file in the
     # "roi_is_ipsilateral" column
-    ipsicontra_val_map = {np.nan: np.nan, 'ipsi': True, 'contra': False}
+    ipsicontra_val_map = {np.nan: np.nan, "ipsi": True, "contra": False}
 
     for roi in [None] + rois_to_evaluate:
         if roi is None:
@@ -349,7 +354,7 @@ def evaluate_sample(plan_data_dict,
                 "roi_is_ipsilateral": sample_roi_is_ipsi,
                 "voxel_aggregation": voxel_aggregation,
                 "gt": agg_fn(sample_gt_roi),
-                "pred": agg_fn(sample_pred_roi)
+                "pred": agg_fn(sample_pred_roi),
             }
 
             # this adds one column for each voxel error type as we can
@@ -359,22 +364,24 @@ def evaluate_sample(plan_data_dict,
                 err_f = voxel_error_type_fns[voxel_error_type]
                 # aggregation of voxelwise errors, e.g.
                 # mean(gt - pred) or mean(|gt - pred|)
-                sample_errors_roi = agg_fn(
-                    err_f(sample_gt_roi, sample_pred_roi))
+                sample_errors_roi = agg_fn(err_f(sample_gt_roi, sample_pred_roi))
                 # error between voxel aggregations, called distributionwise error, e.g.
                 # mean(gt) - mean(pred) or |mean(gt) - mean(pred)|
-                dist_errors_roi = err_f(
-                    agg_fn(sample_gt_roi), agg_fn(sample_pred_roi))
+                dist_errors_roi = err_f(agg_fn(sample_gt_roi), agg_fn(sample_pred_roi))
 
-                sample_roi_result[f"voxelwise_{voxel_error_type}_error"] = sample_errors_roi
-                sample_roi_result[f"distributionwise_{voxel_error_type}_error"] = dist_errors_roi
+                sample_roi_result[f"voxelwise_{voxel_error_type}_error"] = (
+                    sample_errors_roi
+                )
+                sample_roi_result[f"distributionwise_{voxel_error_type}_error"] = (
+                    dist_errors_roi
+                )
 
             results.append(sample_roi_result)
 
         # xcc metrics come here as they can't be computed voxelwise
-        # NOTE: this assumes input to be interpolated to 1mm^3
+        # NOTE: this assumes input to be interpolated to 1mm^3evaluate_sample_gamma
         # this can't be computed voxelwise so those entries should stay with NaN then
-        for x in [.1, .3, 1]:
+        for x in [0.1, 0.3, 1]:
             gt = compute_xcc_metric(sample_gt_roi, x=x)
             pred = compute_xcc_metric(sample_pred_roi, x=x)
 
@@ -384,73 +391,148 @@ def evaluate_sample(plan_data_dict,
                 "roi_is_ipsilateral": sample_roi_is_ipsi,
                 "voxel_aggregation": f"{x}_cc",
                 "gt": gt,
-                "pred": pred
+                "pred": pred,
             }
             for voxel_error_type in voxel_error_types:
                 err_f = voxel_error_type_fns[voxel_error_type]
                 item[f"distributionwise_{voxel_error_type}_error"] = err_f(
-                    item["gt"], item["pred"])
+                    item["gt"], item["pred"]
+                )
 
             results.append(item)
 
     return pd.DataFrame(results)
 
 
-def evaluate_sample_gamma(plan_data_dict,
-                          rois_to_evaluate,
-                          gamma_dose_criteria,
-                          gamma_distance_criteria,
-                          gamma_n_dose_bins):
-
+def evaluate_sample_gamma(
+    plan_data_dict,
+    rois_to_evaluate,
+    gamma_configuration,
+    clinical_var_df_patient,
+    dose_is_rbe_weighted,
+):
     sample_plan = plan_data_dict["plan_id"]
     sample_gt = plan_data_dict["let"]
     sample_pred = plan_data_dict["let_prediction"]
+    sample_dose = plan_data_dict["dose"]
+
+    relevant_dose_area = plan_data_dict["Mask_relevant_dose_area"]
 
     results = []
-    for dose_criteria in gamma_dose_criteria:
-        for distance_criteria in gamma_distance_criteria:
 
-            print(
-                f"Calculating gamma map for {dose_criteria} dose difference and {distance_criteria} distance-to-agreement")
-            sample_gamma = calculate_gamma(true_dose=sample_gt,
-                                           predicted_dose=sample_pred,
-                                           dose_criteria=dose_criteria,
-                                           distance_criteria=distance_criteria)
-            print("Gamma map ready!")
+    for config in gamma_configuration:
+        input_modality = config[0]
+        assert input_modality in [
+            "LET",
+            "wedenberg",
+            "bahn",
+            "constant",
+            "dose*LET",
+        ], f"{input_modality} not implemented in gamma analysis or as varRBE model"
 
-            # one line in the dataframe for each roi of a patient
-            # None means the whole volume irrespective of a ROI
-            for roi in [None] + rois_to_evaluate:
-                if roi is None:
-                    sample_roi = np.ones_like(sample_gt).astype(bool)
-                elif f"Mask_{roi}" in plan_data_dict:
-                    sample_roi = plan_data_dict[f"Mask_{roi}"]
-                else:
-                    # the ROI is not present for the current patient
-                    print(
-                        f"[WW]: {sample_plan} has no ROI {roi}. Will skip!")
-                    continue
+        gamma_setup = config[1]
+        assert gamma_setup in [
+            "local",
+            "global",
+        ], f"{gamma_setup} must be 'global' or 'local'"
 
-                # gamma analysis evaluation
-                gamma_results = evaluate_gamma(
-                    sample_gamma, sample_gt, n_dose_bins=gamma_n_dose_bins, roi_mask=sample_roi)
-                gamma_results["plan_id"] = sample_plan
-                gamma_results["roi"] = roi
-                gamma_results["dose difference"] = dose_criteria
-                gamma_results["distance-to-agreement"] = distance_criteria
+        dose_criteria = config[2]
+        assert dose_criteria >= 0, "Dose criteria must be non-negative."
 
-                results.append(gamma_results)
+        distance_criteria = config[3]
+        assert distance_criteria >= 0, "Distance criteria must be non-negative."
+
+        if input_modality == "LET":
+            input_gamma_true = sample_gt
+            input_gamma_pred = sample_pred
+        else:
+            let_to_rbe_converter_normal_tissue = ntcp.LETtoRBEConverter(
+                input_modality, alphabeta=2.0, rbe_constant=1.1
+            )
+
+            input_gamma_true = let_to_rbe_converter_normal_tissue(
+                dose=sample_dose,
+                let=sample_gt,
+                dose_is_rbe_weighted=dose_is_rbe_weighted,
+                clinical_var_df=clinical_var_df_patient,
+            )
+            input_gamma_pred = let_to_rbe_converter_normal_tissue(
+                dose=sample_dose,
+                let=sample_pred,
+                dose_is_rbe_weighted=dose_is_rbe_weighted,
+                clinical_var_df=clinical_var_df_patient,
+            )
+
+            # Overwrite CTV region with alphabeta = 10
+            let_to_rbe_converter_CTV = ntcp.LETtoRBEConverter(
+                input_modality, alphabeta=10.0, rbe_constant=1.1
+            )
+
+            input_gamma_true[plan_data_dict["Mask_CTV"]] = let_to_rbe_converter_CTV(
+                dose=sample_dose,
+                let=sample_gt,
+                dose_is_rbe_weighted=dose_is_rbe_weighted,
+                clinical_var_df=clinical_var_df_patient,
+            )[plan_data_dict["Mask_CTV"]]
+
+            input_gamma_pred[plan_data_dict["Mask_CTV"]] = let_to_rbe_converter_CTV(
+                dose=sample_dose,
+                let=sample_pred,
+                dose_is_rbe_weighted=dose_is_rbe_weighted,
+                clinical_var_df=clinical_var_df_patient,
+            )[plan_data_dict["Mask_CTV"]]
+
+        print(
+            f"Calculating {gamma_setup} gamma map for {input_modality} with {dose_criteria} dose difference and {distance_criteria} distance-to-agreement"
+        )
+        sample_gamma = calculate_gamma(
+            true_dose=input_gamma_true,
+            predicted_dose=input_gamma_pred,
+            dose_criteria=dose_criteria,
+            distance_criteria=distance_criteria,
+            relevant_dose_area=relevant_dose_area,
+            gamma_setup=gamma_setup,
+        )
+        print("Gamma map ready!")
+
+        # one line in the dataframe for each roi of a plan
+        for roi in rois_to_evaluate:
+            if f"Mask_{roi}" in plan_data_dict:
+                sample_roi = plan_data_dict[f"Mask_{roi}"]
+            else:
+                # the ROI is not present for the current plan
+                print(f"[WW]: {sample_plan} has no ROI {roi}. Will skip!")
+                continue
+
+            print(f"ROI: {roi}")
+            # gamma analysis evaluation
+            gamma_results = evaluate_gamma(
+                sample_gamma,
+                sample_gt,
+                roi_mask=sample_roi,
+                relevant_dose_area=relevant_dose_area,
+            )
+            gamma_results["plan_id"] = sample_plan
+            gamma_results["modality"] = input_modality
+            gamma_results["gamma setup"] = gamma_setup
+            gamma_results["roi"] = roi
+            gamma_results["dose difference"] = dose_criteria
+            gamma_results["distance-to-agreement"] = distance_criteria
+
+            results.append(gamma_results)
 
     return pd.DataFrame(results)
 
 
-def generate_masks(sample_gt,
-                   sample_dose,
-                   sample_ctv_mask,
-                   dose_rel,
-                   let_bins_abs,
-                   dose_bins_abs,
-                   clip_dose_below_threshold):
+def generate_masks(
+    sample_gt,
+    sample_dose,
+    sample_ctv_mask,
+    dose_rel,
+    let_bins_abs,
+    dose_bins_abs,
+    clip_let_below_dose,
+):
     """
     Generate masks based on different binning strategies and thresholds.
 
@@ -467,17 +549,8 @@ def generate_masks(sample_gt,
     result = {}
     mask_names = []
 
-    mean_dose_ctv = np.mean(sample_dose[sample_ctv_mask])
-
     # Initialize bins
-    dict_bins = {
-        "dose": {
-            "abs": dose_bins_abs
-        },
-        "let": {
-            "abs": let_bins_abs
-        }
-    }
+    dict_bins = {"dose": {"abs": dose_bins_abs}, "let": {"abs": let_bins_abs}}
 
     # Generate masks for each bin
     for dist_type in dict_bins.keys():  # dose/let
@@ -490,24 +563,25 @@ def generate_masks(sample_gt,
             for i in range(len(bins)):
                 if i == len(bins) - 1:
                     mask = bin_dist > bins[i]
-                    label1 = str(bins[i]) if bin_type == "abs" else str(
-                        percentiles[i])
+                    label1 = str(bins[i]) if bin_type == "abs" else str(percentiles[i])
                     label2 = "max"
                 else:
-                    mask = (bin_dist > bins[i]) & (bin_dist <= bins[i+1])
-                    label1 = str(bins[i]) if bin_type == "abs" else str(
-                        percentiles[i])
-                    label2 = str(
-                        bins[i+1]) if bin_type == "abs" else str(percentiles[i+1])
+                    mask = (bin_dist > bins[i]) & (bin_dist <= bins[i + 1])
+                    label1 = str(bins[i]) if bin_type == "abs" else str(percentiles[i])
+                    label2 = (
+                        str(bins[i + 1])
+                        if bin_type == "abs"
+                        else str(percentiles[i + 1])
+                    )
 
                 key = f"Mask_{dist_type.capitalize()}_between_{label1}_and_{label2}_{bin_type.capitalize()}"
                 result[key] = mask.astype(bool)
                 mask_names.append(key[5:])
 
     key = "Mask_relevant_dose_area"
-    if clip_dose_below_threshold is not None:
+    if clip_let_below_dose is not None:
         # generate mask for relevant dose are
-        mask = sample_dose > clip_dose_below_threshold
+        mask = sample_dose > clip_let_below_dose
     else:
         mask = np.ones(np.shape(sample_dose))
     result[key] = mask.astype(bool)
@@ -516,15 +590,17 @@ def generate_masks(sample_gt,
     return result, mask_names
 
 
-def compute_metrics(dataset,
-                    plan_predictions,
-                    rois_to_evaluate,
-                    voxel_aggregations,
-                    voxel_error_types,
-                    dose_rel,
-                    let_bins_abs,
-                    dose_bins_abs,
-                    clip_dose_below_threshold):
+def compute_metrics(
+    dataset,
+    plan_predictions,
+    rois_to_evaluate,
+    voxel_aggregations,
+    voxel_error_types,
+    dose_rel,
+    let_bins_abs,
+    dose_bins_abs,
+    clip_let_below_dose,
+):
     """
     Function to compute metrics based on step outputs.
 
@@ -537,7 +613,7 @@ def compute_metrics(dataset,
     :param dose_percentiles: Percentiles to consider for the relative dose bins.
     :param let_bins_abs: Bin edges to consider for the absolute LET bins.
     :param dose_bins_abs: Bin edges to consider for the absolute dose bins.
-    :param clip_dose_below_threshold: (normalized) dose level from which
+    :param clip_let_below_dose: (normalized) dose level from which
                                       upward we consider the relevant dose area
     :return: List of batch metrics.
     """
@@ -553,7 +629,7 @@ def compute_metrics(dataset,
             # convert to numpy, discard color channel
             "let": plan_data_dict["let"].numpy()[0],
             # discard color channel, is already numpy
-            "let_prediction": plan_predictions[plan_id][0]
+            "let_prediction": plan_predictions[plan_id][0],
         }
 
         # copy all masks (they dont have color channel)
@@ -572,7 +648,8 @@ def compute_metrics(dataset,
             dose_rel,
             let_bins_abs,
             dose_bins_abs,
-            clip_dose_below_threshold)
+            clip_let_below_dose,
+        )
 
         # Insert masks into the plan_data_dict
         for key in masks_dict:
@@ -592,26 +669,45 @@ def compute_metrics(dataset,
                 eval_data[f"Mask_{roi_name_new}"] = roi & relevant_dose_roi
                 rois_and_relevant_dose.append(roi_name_new)
 
-        rois = (rois_to_evaluate + mask_names + rois_and_relevant_dose)
+        rois = rois_to_evaluate + mask_names + rois_and_relevant_dose
         metrics.append(
             evaluate_sample(
                 eval_data,
                 voxel_aggregations=voxel_aggregations,
                 rois_to_evaluate=rois,
-                voxel_error_types=voxel_error_types))
+                voxel_error_types=voxel_error_types,
+            )
+        )
 
     return pd.concat(metrics, ignore_index=True)
 
 
-def compute_gamma(dataset,
-                  plan_predictions,
-                  rois_to_evaluate,
-                  gamma_dose_criteria,
-                  gamma_distance_criteria,
-                  gamma_n_dose_bins):
-
+def compute_gamma(
+    dataset,
+    plan_predictions,
+    rois_to_evaluate,
+    gamma_configuration,
+    plan_table_path,
+    dose_rel,
+    let_bins_abs,
+    dose_bins_abs,
+    clip_let_below_dose,
+    dose_is_rbe_weighted,
+    use_multithreading,
+):
     metrics = []
-    for plan_idx in tqdm(range(len(dataset)), desc="Computing metrics"):
+
+    if plan_table_path is not None:
+        # Read all sheets from the Excel file into a dictionary of DataFrames
+        clinical_var_df_dict = pd.read_excel(plan_table_path, sheet_name=None)
+        # Concatenate all DataFrames into a single DataFrame
+        clinical_var_df_combined = pd.concat(
+            clinical_var_df_dict.values(), ignore_index=True
+        )
+    else:
+        clinical_var_df_combined = None
+
+    def process_plan(plan_idx):
         plan_data_dict = dataset[plan_idx]
         plan_id = plan_data_dict["plan_id"]
 
@@ -622,30 +718,86 @@ def compute_gamma(dataset,
             # convert to numpy, discard color channel
             "let": plan_data_dict["let"].numpy()[0],
             # discard color channel, is already numpy
-            "let_prediction": plan_predictions[plan_id][0]
+            "let_prediction": plan_predictions[plan_id][0],
         }
 
         # copy all masks (they dont have color channel)
+        assert "Mask_CTV" in plan_data_dict, "No CTV in available!"
         for k in plan_data_dict:
             if k.startswith("Mask_"):
                 eval_data[k] = plan_data_dict[k]
 
-        metrics.append(
-            evaluate_sample_gamma(
-                eval_data,
-                rois_to_evaluate=rois_to_evaluate,
-                gamma_dose_criteria=gamma_dose_criteria,
-                gamma_distance_criteria=gamma_distance_criteria,
-                gamma_n_dose_bins=gamma_n_dose_bins))
+        # generate further masks based on the dose and LET statistics
+        # e.g. regions where dose/LET is above a given value
+        # NOTE: here the 'relevant_dose_area' mask is also created
+        masks_dict, mask_names = generate_masks(
+            eval_data["let"],
+            eval_data["dose"],
+            eval_data["Mask_CTV"],
+            dose_rel,
+            let_bins_abs,
+            dose_bins_abs,
+            clip_let_below_dose,
+        )
+
+        # Insert masks into the plan_data_dict
+        for key in masks_dict:
+            eval_data[key] = masks_dict[key]
+
+        # add the masks of ROI * "Mask_relevant_dose_area"
+        # to the eval_data (with Mask_ prefix) and to the mask_names
+        # (without the Mask_ prefix)
+        relevant_dose_roi = eval_data["Mask_relevant_dose_area"]
+        rois_to_compute_gamma = []
+        rois_to_compute_gamma.append("relevant_dose_area")
+
+        for k in list(eval_data.keys()):
+            if k.startswith("Mask_") and k != "Mask_relevant_dose_area":
+                roi = eval_data[k]
+                roi_name = k.split("Mask_")[1]
+                roi_name_new = f"relevant_dose_area_{roi_name}"
+
+                eval_data[f"Mask_{roi_name_new}"] = roi & relevant_dose_roi
+                rois_to_compute_gamma.append(roi_name_new)
+
+        if clinical_var_df_combined is not None:
+            # Filter the combined DataFrame based on the plan_id
+            clinical_var_df_patient = clinical_var_df_combined.loc[
+                clinical_var_df_combined["plan_id"] == eval_data["plan_id"], :
+            ]
+        else:
+            clinical_var_df_patient = None
+
+        return evaluate_sample_gamma(
+            eval_data,
+            rois_to_evaluate=rois_to_compute_gamma,
+            gamma_configuration=gamma_configuration,
+            clinical_var_df_patient=clinical_var_df_patient,
+            dose_is_rbe_weighted=dose_is_rbe_weighted,
+        )
+
+    if use_multithreading:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = [
+                executor.submit(process_plan, plan_idx)
+                for plan_idx in range(len(dataset))
+            ]
+            for future in tqdm(
+                concurrent.futures.as_completed(futures),
+                total=len(futures),
+                desc="Computing gamma passing rates",
+            ):
+                metrics.append(future.result())
+    else:
+        for plan_idx in tqdm(range(len(dataset)), desc="Computing gamma passing rates"):
+            metrics.append(process_plan(plan_idx))
 
     return pd.concat(metrics, ignore_index=True)
 
 
 def main(args):
     # no seeding is necessary since inference does not involve randomness
-    plan_ids = pd.read_csv(
-        args.valid_id_file,
-        header=None).values.squeeze().tolist()
+    plan_ids = pd.read_csv(args.valid_id_file, header=None).values.squeeze().tolist()
 
     dataset = LETDatasetInMemory(
         data_dir=args.data_dir,
@@ -661,7 +813,8 @@ def main(args):
         clip_let_below_dose=args.clip_let_below_dose,
         multiply_let_by_dose=args.multiply_let_by_dose,
         ct_window=args.ct_window,
-        ct_normalisation=not args.no_ct_normalisation)
+        ct_normalisation=not args.no_ct_normalisation,
+    )
 
     # custom collate function to avoid putting
     # all the loaded ROIs to the device!
@@ -670,7 +823,8 @@ def main(args):
         batch_size=args.batch_size,
         num_workers=0,
         shuffle=False,
-        collate_fn=collate_for_prediction)
+        collate_fn=collate_for_prediction,
+    )
 
     if args.model_type == "basic_unet":
         model_cls = BasicUNetLETPredictor
@@ -688,8 +842,8 @@ def main(args):
 
     # get the predictions only, not the masks
     trainer = pl.Trainer(
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=args.gpus)
+        accelerator="gpu" if torch.cuda.is_available() else "cpu", devices=args.gpus
+    )
     batch_predictions = trainer.predict(model, loader)
 
     # get the predictions as a dictionary for each plan, not batched anymore
@@ -701,40 +855,44 @@ def main(args):
 
         for pidx in range(len(plan_ids)):
             plan_id = plan_ids[pidx]
-            plan_predictions[plan_id] = batch_preds[pidx].detach(
-            ).cpu().numpy()
+            plan_predictions[plan_id] = batch_preds[pidx].detach().cpu().numpy()
 
-    metric_df = compute_metrics(
-        dataset,
-        plan_predictions,
-        rois_to_evaluate=args.rois_to_evaluate,
-        voxel_aggregations=args.voxel_aggregation,
-        voxel_error_types=args.voxel_error_type,
-        dose_rel=np.array(args.dose_rel),
-        let_bins_abs=np.array(args.let_bins_abs),
-        dose_bins_abs=np.array(args.dose_bins_abs),
-        clip_dose_below_threshold=args.clip_let_below_dose)
-
-    print(metric_df)
-    print(metric_df.describe())
     output_dir = Path(args.output_dir)
-    metric_df.to_csv(
-        output_dir / "model_performance.csv",
-        index=False)
+
+    if args.execute_metric_computation:
+        metric_df = compute_metrics(
+            dataset,
+            plan_predictions,
+            rois_to_evaluate=args.rois_to_evaluate,
+            voxel_aggregations=args.voxel_aggregation,
+            voxel_error_types=args.voxel_error_type,
+            dose_rel=np.array(args.dose_rel),
+            let_bins_abs=np.array(args.let_bins_abs),
+            dose_bins_abs=np.array(args.dose_bins_abs),
+            clip_let_below_dose=args.clip_let_below_dose,
+        )
+
+        print(metric_df)
+        print(metric_df.describe())
+        metric_df.to_csv(output_dir / "model_performance.csv", index=False)
     if not args.no_gamma:
         gamma_df = compute_gamma(
             dataset,
             plan_predictions,
             rois_to_evaluate=args.rois_to_evaluate,
-            gamma_dose_criteria=args.gamma_dose_criteria,
-            gamma_distance_criteria=args.gamma_distance_criteria,
-            gamma_n_dose_bins=args.gamma_n_dose_bins)
+            gamma_configuration=args.gamma_configuration,
+            plan_table_path=args.plan_table_path,
+            dose_rel=np.array(args.dose_rel),
+            let_bins_abs=np.array(args.let_bins_abs),
+            dose_bins_abs=np.array(args.dose_bins_abs),
+            clip_let_below_dose=args.clip_let_below_dose,
+            dose_is_rbe_weighted=not args.physical_dose,
+            use_multithreading=args.use_gamma_multithreading,
+        )
 
         print(gamma_df)
         print(gamma_df.describe())
-        gamma_df.to_csv(
-            output_dir / "model_performance_gamma.csv",
-            index=False)
+        gamma_df.to_csv(output_dir / "model_performance_gamma.csv", index=False)
     else:
         print("No gamma-analysis will be performed.")
 
@@ -758,13 +916,12 @@ if __name__ == "__main__":
     if not output_dir.is_dir():
         output_dir.mkdir(parents=True)
     else:
-        raise ValueError(
-            f"output_dir {output_dir} already exists!")
+        raise ValueError(f"output_dir {output_dir} already exists!")
 
     print(f"\nUsing {output_dir} as output directory.")
 
     # storing the commandline arguments to a json file
-    with open(output_dir / "commandline_args.json", 'w') as of:
+    with open(output_dir / "commandline_args.json", "w") as of:
         json.dump(vars(args), of, indent=2)
 
     retval = main(args)

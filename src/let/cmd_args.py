@@ -1,4 +1,27 @@
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
+
+def parse_list_of_tuples(input_str):
+    """
+    Parse a representation of a list of tuples.
+    """
+
+    try:
+        parts = input_str.split(",")
+        assert len(parts) == 4, "Parameter has to have four parts separated by ','"
+
+        input_modality, loc_or_glob, dd, dta = parts
+        assert input_modality in ["wedenberg", "bahn", "constant", "dose*LET", "LET"], f"First part '{input_modality}' not valid. Choose one of 'wedenberg', 'bahn', 'constant', 'LET' or 'dose*LET'"
+        assert loc_or_glob in ["local", "global"], f"Second part '{loc_or_glob}' not valid. Choose 'local' or 'global'"
+
+        dd = float(dd)
+        dta = float(dta)
+
+    except Exception as e:
+        print(e)
+
+        raise ArgumentTypeError("Parameter must be <rbe_method>,<local/global>,<dose_difference>,<distance_to_agreement>")
+
+    return input_modality, loc_or_glob, dd, dta
 
 
 def add_dataset_args(parser):
@@ -80,6 +103,14 @@ def add_dataset_args(parser):
         action="store_true",
         default=False,
         help="CT values will not be normalised to unit range after windowing."
+    )
+    group.add_argument(
+        "--physical_dose",
+        action="store_true",
+        default=False,
+        help="Specify that doses that are read are physical doses."
+             "Otherwise assume they are clinically RBE weighted doses "
+             "with factor 1.1 multiplied to the physical dose."
     )
 
     return parser
@@ -210,31 +241,37 @@ def add_inference_args(parser):
     )
 
     group.add_argument(
-        "--no_gamma",
-        default=False,
-        action="store_true"
+        "--execute_metric_computation",
+        action="store_true",
+        help="Flag to enable the calculation of classic metrics (DW,VW,percentiles,...). Argument should be set to perform computations."
     )
 
     group.add_argument(
-        "--gamma_dose_criteria",
-        type=float,
-        default=[2., 5., 10.],
-        help="(Local) dose difference criteria in % of the gamma analysis.",
-        nargs='+'
+        "--no_gamma",
+        action="store_true",
+        help="Flag to disable the gamma analysis. Argument should be set to not perform analysis."
     )
+
+    parser.add_argument(
+        '--gamma_configuration',
+        type=parse_list_of_tuples,
+        nargs="+",
+        default="[]",
+        help=(
+            "A pythonic string respresentation of a list of tuples for gamma configuration."
+            "Each tuple should have 4 elements: "
+            "input_modality (str), gamma_type (str: 'local' or 'global'), "
+            "dose_difference (float, in %), distance_to_agreement (float, in voxel size). "
+            "Example: wedenberg,local,3.,3. wedenberg,local,2.,2."
+            )
+    )
+
     group.add_argument(
-        "--gamma_distance_criteria",
-        type=float,
-        default=[2.],
-        help="Distance to agreement criteria in mm of the gamma analysis.",
-        nargs='+'
+        "--use_gamma_multithreading",
+        action="store_true",
+        help="Flag to enable multithreading for gamma analysis. Argument should be set to use multithreading."
     )
-    group.add_argument(
-        "--gamma_n_dose_bins",
-        type=int,
-        default=5,
-        help="Number of dose ranges to be evaluated in the gamma analysis."
-    )
+
     group.add_argument(
         "--output_dir",
         type=str,
@@ -316,14 +353,6 @@ def add_ntcp_args(parser):
         help="When choosing let_to_rbe_conversion='constant'"
              " this defines the constant by which to multiply"
              " the dose to obtain an RBE weighted dose."
-    )
-    group.add_argument(
-        "--physical_dose",
-        action="store_true",
-        default=False,
-        help="Specify that doses that are read are physical doses."
-             "Otherwise assume they are clinically RBE weighted doses "
-             "with factor 1.1 multiplied to the physical dose."
     )
     group.add_argument(
         "--output_dir",

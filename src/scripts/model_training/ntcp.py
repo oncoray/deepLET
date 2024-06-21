@@ -175,7 +175,7 @@ def evaluate_ntcp_models(model,
         ntcp_model = ntcp_cls()
         alphabeta = alphabeta_per_roi[ntcp_model.involved_roi]
 
-        for let_to_rbe_conversion in ["bahn", "wedenberg", "constant"]:
+        for let_to_rbe_conversion in ["bahn", "wedenberg", "constant", "dose*LET"]:
             let_to_rbe_converter = ntcp.LETtoRBEConverter(
                 let_to_rbe_conversion,
                 alphabeta=alphabeta,

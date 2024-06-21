@@ -310,7 +310,7 @@ class LETtoRBEConverter():
                  alphabeta=2.,  # only used with 'wedenberg' mode
                  rbe_constant=1.1  # only used with 'constant' mode
                  ):
-        assert let_to_rbe_conversion in ["wedenberg", "bahn", "constant"]
+        assert let_to_rbe_conversion in ["wedenberg", "bahn", "constant", "dose*LET"]
         self.let_to_rbe_conversion = let_to_rbe_conversion
         self.alphabeta = alphabeta
         self.rbe_constant = rbe_constant
@@ -385,6 +385,11 @@ class LETtoRBEConverter():
 
             print(f"Using 'rbe_constant' {self.rbe_constant}.")
             rbe = self.rbe_constant * np.ones_like(let)
+
+        elif self.let_to_rbe_conversion == "dose*LET":
+
+            rbe = let
+
         else:
             raise ValueError(
                 f"let_to_rbe_conversion {self.let_to_rbe_conversion} "
