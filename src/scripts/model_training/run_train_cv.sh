@@ -2,7 +2,7 @@
 #SBATCH --job-name=let_segresnet
 #SBATCH --nodes=1
 #SBATCH -c 8
-#SBATCH --mem-per-cpu 25000
+#SBATCH --mem-per-cpu 35000
 #SBATCH --gres=gpu:1
 #SBATCH --time=38:00:00
 #SBATCH --array 0-4
@@ -48,15 +48,17 @@ UNETR_HIDDEN_SIZE=64
 UNETR_MLP_DIM=256
 UNETR_NUM_HEADS=8
 
-DATA_SPLIT_DIR="../../../data/dd_pbs/data_splits"
+DATA_SPLIT_DIR="../../../data/data_splits" # TODO: adapt
 TRAIN_ID_FILE=$DATA_SPLIT_DIR/5_fold_cv/train_plan_ids_fold_$FOLD.csv
 VALID_ID_FILE=$DATA_SPLIT_DIR/5_fold_cv/val_plan_ids_fold_$FOLD.csv
 
-OUTPUT_DIR_BASE=$HOME"/experiments/let_prediction_new/dd_pbs"
+OUTPUT_DIR_BASE=$HOME"/experiments/let_prediction"
 #OUTPUT_DIR=$OUTPUT_DIR_BASE/"cohort_with_mono_and_spr/CTspr-LETd"/"clip_let_below_"$CLIP_LET_BELOW_DOSE/$MODEL_TYPE/"fold_"$FOLD
 OUTPUT_DIR=$OUTPUT_DIR_BASE/"Dose-LETd"/"clip_let_below_"$CLIP_LET_BELOW_DOSE/$MODEL_TYPE/"fold_"$FOLD
 #OUTPUT_DIR=$OUTPUT_DIR_BASE/"cohort_with_mono_and_spr/Dose-LETd"/"no_let_clip_trainloss-weighted-by-dose"/$MODEL_TYPE/"fold_"$FOLD
 TRAIN_OUTPUT_DIR=$OUTPUT_DIR/"training"
+
+GAMMA_CONFIGURATION=(wedenberg,global,3.,3. LET,global,3.,1.)
 
 python train.py --default_root_dir $TRAIN_OUTPUT_DIR\
                 --accelerator "gpu"\
@@ -89,9 +91,9 @@ python train.py --default_root_dir $TRAIN_OUTPUT_DIR\
                 --unetr_num_heads $UNETR_NUM_HEADS\
                 --no_data_augmentation\
                 # --use_ct\
-                #--weight_loss_by_dose\
-                #--multiply_let_by_dose\
-                #--no_ct_normalisation\
+                # --weight_loss_by_dose\
+                # --multiply_let_by_dose\
+                # --no_ct_normalisation\
 
 
 
@@ -128,6 +130,13 @@ python inference.py --output_dir $INFERENCE_OUT_TRAIN\
                     --rois_to_evaluate ${INFERENCE_ROIS[*]}\
                     --voxel_aggregation ${VOXEL_AGGREGATION[*]}\
                     --voxel_error_type ${VOXEL_ERROR_TYPE[*]}\
+                    --clip_let_below_dose $CLIP_LET_BELOW_DOSE\
+                    --plan_table_path $PLAN_TABLE_PATH\
+                    --execute_metric_computation\
+                    --gamma_configuration ${GAMMA_CONFIGURATION[*]}\
+                    # --use_gamma_multithreading\
+                    # --no_gamma \
+                    # --physical_dose\
                     # --use_ct\
                     # --multiply_let_by_dose\
                     # --no_ct_normalisation\
@@ -151,6 +160,13 @@ python inference.py --output_dir $INFERENCE_OUT_VAL\
                     --rois_to_evaluate ${INFERENCE_ROIS[*]}\
                     --voxel_aggregation ${VOXEL_AGGREGATION[*]}\
                     --voxel_error_type ${VOXEL_ERROR_TYPE[*]}\
+                    --clip_let_below_dose $CLIP_LET_BELOW_DOSE\
+                    --plan_table_path $PLAN_TABLE_PATH\
+                    --execute_metric_computation\
+                    --gamma_configuration ${GAMMA_CONFIGURATION[*]}\
+                    # --use_gamma_multithreading\
+                    # --no_gamma \
+                    # --physical_dose\
                     # --use_ct\
                     # --multiply_let_by_dose\
                     # --no_ct_normalisation\
